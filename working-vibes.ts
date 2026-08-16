@@ -2,13 +2,36 @@
 // AI-generated contextual working messages that match a user's preferred theme/vibe.
 // Uses module-level state (matching powerline-footer pattern).
 
-import { complete, type Context } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, Model, ProviderStreamOptions } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { getAgentPath } from "./paths.ts";
+import { applyColor, rainbow } from "./theme.ts";
+import type { ColorValue, ThemeLike } from "./types.ts";
 
 type VibeMode = "generate" | "file";
+
+// Extension-registered providers live in the model registry only: their custom `api` values
+// are absent from pi-ai's global api table, so streaming has to go through the provider.
+// Credential-derived base URLs are resolved per request, mirroring ModelRuntime.prepareRequest;
+// getApiKeyAndHeaders() covers the rest of the request auth but never reports a base URL.
+async function completeVibe(
+  providerId: string,
+  model: Model<string>,
+  context: Context,
+  options: ProviderStreamOptions,
+): Promise<AssistantMessage> {
+  const registry = extensionCtx?.modelRegistry;
+  const provider = registry?.getProvider(providerId);
+  if (!registry || !provider) {
+    throw new Error(`Provider not registered: ${providerId}`);
+  }
+
+  const baseUrl = (await registry.getProviderAuth(providerId))?.auth.baseUrl;
+  const requestModel = baseUrl ? { ...model, baseUrl } : model;
+  return provider.stream(requestModel, context, options).result();
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -61,6 +84,8 @@ let extensionCtx: ExtensionContext | null = null;
 let currentGeneration: AbortController | null = null;
 let isStreaming = false;
 let lastVibeTime = 0;
+let workingMessageTheme: ThemeLike | null = null;
+let workingMessageColor: ColorValue | "rainbow" | undefined;
 
 // File-based mode state
 let vibeCache: string[] = [];        // Cached vibes from file
@@ -77,8 +102,7 @@ let recentVibes: string[] = [];
 // ═══════════════════════════════════════════════════════════════════════════
 
 function getSettingsPath(): string {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || homedir();
-  return join(homeDir, ".pi", "agent", "settings.json");
+  return getAgentPath("settings.json");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -161,6 +185,7 @@ function loadConfig(): VibeConfig {
       ? Math.max(4, Math.floor(settings.workingVibeMaxLength))
       : 65;
 
+
   return {
     theme,
     mode,
@@ -208,8 +233,7 @@ function saveModelConfig(): boolean {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function getVibesDir(): string {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || homedir();
-  return join(homeDir, ".pi", "agent", "vibes");
+  return getAgentPath("vibes");
 }
 
 function toVibeFileSlug(theme: string): string {
@@ -402,8 +426,7 @@ async function generateVibe(
   }
   
   const aiContext = buildAiContext(buildVibePrompt(ctx));
-  
-  const response = await complete(model, aiContext, { apiKey: auth.apiKey, headers: auth.headers, signal });
+  const response = await completeVibe(provider, model, aiContext, { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal });
 
   const textContent = response.content.find(c => c.type === "text");
   if (!textContent?.text && response.stopReason === "error" && response.errorMessage) {
@@ -420,8 +443,19 @@ function trackRecentVibe(vibe: string): void {
   recentVibes = [vibe, ...recentVibes.filter(v => v !== vibe)].slice(0, MAX_RECENT_VIBES);
 }
 
+function setStyledWorkingMessage(setWorkingMessage: (msg?: string) => void, message?: string): void {
+  if (!message || !workingMessageColor || !workingMessageTheme) {
+    setWorkingMessage(message);
+    return;
+  }
+
+  setWorkingMessage(workingMessageColor === "rainbow"
+    ? rainbow(message)
+    : applyColor(workingMessageTheme, workingMessageColor, message));
+}
+
 function updateVibeFromFile(setWorkingMessage: (msg?: string) => void): void {
-  setWorkingMessage(getNextVibeFromFile());
+  setStyledWorkingMessage(setWorkingMessage, getNextVibeFromFile());
 }
 
 async function generateAndUpdate(
@@ -457,7 +491,7 @@ async function generateAndUpdate(
     // Only update if still streaming and THIS generation wasn't aborted
     if (isStreaming && !controller.signal.aborted) {
       trackRecentVibe(vibe);
-      setWorkingMessage(vibe);
+      setStyledWorkingMessage(setWorkingMessage, vibe);
     }
   } catch (error) {
     // AbortError is expected on timeout/cancel - don't log as error
@@ -473,6 +507,14 @@ async function generateAndUpdate(
 // ═══════════════════════════════════════════════════════════════════════════
 // Exported Functions (called from index.ts)
 // ═══════════════════════════════════════════════════════════════════════════
+
+export function setVibeWorkingMessageTheme(theme: ThemeLike): void {
+  workingMessageTheme = theme;
+}
+
+export function setVibeWorkingMessageColor(color: ColorValue | "rainbow" | undefined): void {
+  workingMessageColor = color;
+}
 
 export function initVibeManager(ctx: ExtensionContext): void {
   extensionCtx = ctx;
@@ -507,7 +549,7 @@ export function onVibeBeforeAgentStart(
   
   // Queue themed placeholder BEFORE agent_start creates the loader
   // This sets pendingWorkingMessage which is applied when loader is created
-  setWorkingMessage(`Channeling ${config.theme}...`);
+  setStyledWorkingMessage(setWorkingMessage, `Channeling ${config.theme}...`);
   
   // Mark vibe generation time for rate limiting
   lastVibeTime = Date.now();
@@ -600,11 +642,23 @@ export function getVibeFileCount(theme: string): number {
   return vibes.length;
 }
 
-export interface GenerateVibesResult {
-  success: boolean;
-  count: number;
-  filePath: string;
-  error?: string;
+export type GenerateVibesResult =
+  | { success: true; count: number; filePath: string }
+  | { success: false; count: 0; filePath: string; error: string };
+
+export function parseVibeGenerateArgs(args: readonly string[]): { theme: string; count: number } | null {
+  if (args.length === 0) return null;
+
+  const last = args.at(-1);
+  const parsedCount = last && /^\d+$/.test(last) ? Number.parseInt(last, 10) : Number.NaN;
+  const hasCount = Number.isFinite(parsedCount) && args.length > 1;
+  const theme = hasCount ? args.slice(0, -1).join(" ") : args.join(" ");
+  if (!theme) return null;
+
+  return {
+    theme,
+    count: hasCount ? Math.min(Math.max(Math.floor(parsedCount), 1), 500) : 100,
+  };
 }
 
 export async function generateVibesBatch(
@@ -648,7 +702,7 @@ export async function generateVibesBatch(
   try {
     // Use longer timeout for batch generation (30 seconds)
     const signal = AbortSignal.timeout(30000);
-    const response = await complete(model, aiContext, { apiKey: auth.apiKey, headers: auth.headers, signal });
+    const response = await completeVibe(provider, model, aiContext, { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal });
     
     const textContent = response.content.find(c => c.type === "text");
     if (!textContent?.text) {

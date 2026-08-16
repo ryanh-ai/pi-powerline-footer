@@ -1,9 +1,9 @@
-import { readdirSync, existsSync, statSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
-import { homedir as osHomedir } from "node:os";
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth as tuiTruncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { ansi, fgOnly, getFgAnsiCode } from "./colors.ts";
+import { getAgentPath, getAgentSessionDirs, getHomeDir } from "./paths.ts";
 
 export interface RecentSession {
   name: string;
@@ -15,6 +15,13 @@ export interface LoadedCounts {
   extensions: number;
   skills: number;
   promptTemplates: number;
+}
+
+function formatTokens(tokens: number): string {
+  if (tokens < 1000) return tokens.toString();
+  if (tokens < 10000) return `${(tokens / 1000).toFixed(1)}k`;
+  if (tokens < 1000000) return `${Math.round(tokens / 1000)}k`;
+  return `${(tokens / 1000000).toFixed(tokens < 10000000 ? 1 : 0)}M`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -38,6 +45,7 @@ const GRADIENT_COLORS = [
   "\x1b[38;5;75m",
   "\x1b[38;5;51m",
 ];
+const SESSION_HEADER_READ_BYTES = 8192;
 
 function bold(text: string): string {
   return `\x1b[1m${text}\x1b[22m`;
@@ -85,6 +93,7 @@ interface WelcomeData {
   providerName: string;
   recentSessions: RecentSession[];
   loadedCounts: LoadedCounts;
+  initialContextTokens: number | null;
 }
 
 function buildLeftColumn(data: WelcomeData, colWidth: number): string[] {
@@ -137,6 +146,14 @@ function buildRightColumn(data: WelcomeData, colWidth: number): string[] {
     }
   } else {
     countLines.push(` ${dim("No extensions loaded")}`);
+  }
+
+  if (
+    data.initialContextTokens !== null
+    && Number.isFinite(data.initialContextTokens)
+    && data.initialContextTokens > 0
+  ) {
+    countLines.push(` ${itemPrefix}${fgOnly("gitClean", `≈ ${formatTokens(data.initialContextTokens)}`)} initial prompt tokens`);
   }
   
   return [
@@ -226,8 +243,9 @@ export class WelcomeComponent implements Component {
     providerName: string,
     recentSessions: RecentSession[] = [],
     loadedCounts: LoadedCounts = { contextFiles: 0, extensions: 0, skills: 0, promptTemplates: 0 },
+    initialContextTokens: number | null = null,
   ) {
-    this.data = { modelName, providerName, recentSessions, loadedCounts };
+    this.data = { modelName, providerName, recentSessions, loadedCounts, initialContextTokens };
   }
 
   setCountdown(seconds: number): void {
@@ -276,8 +294,9 @@ export class WelcomeHeader implements Component {
     providerName: string,
     recentSessions: RecentSession[] = [],
     loadedCounts: LoadedCounts = { contextFiles: 0, extensions: 0, skills: 0, promptTemplates: 0 },
+    initialContextTokens: number | null = null,
   ) {
-    this.data = { modelName, providerName, recentSessions, loadedCounts };
+    this.data = { modelName, providerName, recentSessions, loadedCounts, initialContextTokens };
   }
 
   invalidate(): void {}
@@ -315,6 +334,15 @@ export class WelcomeHeader implements Component {
 const loggedDiscoveryErrors = new Set<string>();
 
 function logDiscoveryError(scope: string, error: unknown): void {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT"
+  ) {
+    return;
+  }
+
   const message = error instanceof Error ? error.message : String(error);
   const key = `${scope}:${message}`;
   if (loggedDiscoveryErrors.has(key)) {
@@ -333,7 +361,7 @@ function logDiscoveryError(scope: string, error: unknown): void {
  * Discover loaded counts by scanning filesystem.
  */
 export function discoverLoadedCounts(): LoadedCounts {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || osHomedir();
+  const homeDir = getHomeDir();
   const cwd = process.cwd();
   
   let contextFiles = 0;
@@ -342,7 +370,7 @@ export function discoverLoadedCounts(): LoadedCounts {
   let promptTemplates = 0;
 
   const agentsMdPaths = [
-    join(homeDir, ".pi", "agent", "AGENTS.md"),
+    getAgentPath("AGENTS.md"),
     join(homeDir, ".claude", "AGENTS.md"),
     join(cwd, "AGENTS.md"),
     join(cwd, ".pi", "AGENTS.md"),
@@ -354,7 +382,7 @@ export function discoverLoadedCounts(): LoadedCounts {
   }
 
   const extensionDirs = [
-    join(homeDir, ".pi", "agent", "extensions"),
+    getAgentPath("extensions"),
     join(cwd, "extensions"),
     join(cwd, ".pi", "extensions"),
   ];
@@ -362,7 +390,7 @@ export function discoverLoadedCounts(): LoadedCounts {
   const countedExtensions = new Set<string>();
 
   const settingsPaths = [
-    join(homeDir, ".pi", "agent", "settings.json"),
+    getAgentPath("settings.json"),
     join(cwd, ".pi", "settings.json"),
   ];
 
@@ -459,7 +487,7 @@ export function discoverLoadedCounts(): LoadedCounts {
   }
 
   const skillDirs = [
-    join(homeDir, ".pi", "agent", "skills"),
+    getAgentPath("skills"),
     join(cwd, ".pi", "skills"),
     join(cwd, "skills"),
   ];
@@ -492,7 +520,7 @@ export function discoverLoadedCounts(): LoadedCounts {
   }
 
   const templateDirs = [
-    join(homeDir, ".pi", "agent", "commands"),
+    getAgentPath("commands"),
     join(homeDir, ".claude", "commands"),
     join(cwd, ".pi", "commands"),
     join(cwd, ".claude", "commands"),
@@ -536,13 +564,41 @@ export function discoverLoadedCounts(): LoadedCounts {
 /**
  * Get recent sessions from the sessions directory.
  */
+function readSessionHeaderProjectName(filePath: string): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(filePath, "r");
+    const buffer = Buffer.alloc(SESSION_HEADER_READ_BYTES);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    const firstLine = buffer.toString("utf8", 0, bytesRead).split(/\r?\n/, 1)[0]?.trim();
+    if (!firstLine) return null;
+
+    const header: unknown = JSON.parse(firstLine);
+    if (typeof header !== "object" || header === null || Array.isArray(header)) return null;
+
+    const cwd = Reflect.get(header, "cwd");
+    if (typeof cwd !== "string" || cwd.trim().length === 0) return null;
+
+    return basename(cwd) || cwd;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function sessionProjectNameFromDirectory(dir: string): string {
+  const parentName = basename(dir);
+  if (!parentName.startsWith("--")) {
+    return parentName;
+  }
+
+  const parts = parentName.split("-").filter(p => p);
+  return parts[parts.length - 1] || parentName;
+}
+
 export function getRecentSessions(maxCount: number = 3): RecentSession[] {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || osHomedir();
-  
-  const sessionsDirs = [
-    join(homeDir, ".pi", "agent", "sessions"),
-    join(homeDir, ".pi", "sessions"),
-  ];
+  const sessionsDirs = getAgentSessionDirs();
   
   const sessions: { name: string; mtime: number }[] = [];
   
@@ -557,12 +613,7 @@ export function getRecentSessions(maxCount: number = 3): RecentSession[] {
           if (stats.isDirectory()) {
             scanDir(entryPath);
           } else if (entry.endsWith(".jsonl")) {
-            const parentName = basename(dir);
-            let projectName = parentName;
-            if (parentName.startsWith("--")) {
-              const parts = parentName.split("-").filter(p => p);
-              projectName = parts[parts.length - 1] || parentName;
-            }
+            const projectName = readSessionHeaderProjectName(entryPath) ?? sessionProjectNameFromDirectory(dir);
             sessions.push({ name: projectName, mtime: stats.mtimeMs });
           }
         } catch (error) {
